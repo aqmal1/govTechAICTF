@@ -4,7 +4,7 @@
 
 ![KopiTalk Screenshot](img/media/image1.png)
 
-Being a coffee addict, I recorded myself saying "kopi peng", which is my default order, and uploaded it. However, I could not get the Healthy tokens option to be true. So, I uploaded myself saying "auntie kopi o kosong auntie kopi o kosong" and got the flag!
+Being a coffee addict, I recorded myself saying "kopi peng", which is my default order, and uploaded it. However, I could not get the **Healthy tokens** option to be true. So, I uploaded myself saying "auntie kopi o kosong auntie kopi o kosong" and got the flag!
 
 ![Flag Result](img/media/image2.png)
 
@@ -222,7 +222,7 @@ except Exception as e:
 
 Used OpenAI CLIP to classify human images vs scooter images. Plot the classification which will show a QR code.
 
-Flag: ``AI2025{5tr1d3s4f3_15_l1t}``
+**Flag:** `AI2025{5tr1d3s4f3_15_l1t}`
 
 ![QR Code 1](img/media/image5.png)
 ![QR Code 2](img/media/image6.png)
@@ -316,7 +316,10 @@ const Index = () => {
   const videoId = "M2B7wSxwDcQ";
   const videoSrc = `https://www.youtube.com/embed/${videoId}?autoplay=1&loop=1&playlist=${videoId}&controls=0&showinfo=0&rel=0&iv_load_policy=3&modestbranding=1&mute=${musicStarted ? 0 : 1}`;
 
-  const scrollToBottom = () => 
+  const scrollToBottom = () => {
+    if (chatContainerRef.current) {
+      chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
+    }
   };
 
   const handleInteraction = () => {
@@ -492,7 +495,14 @@ const Index = () => {
                 timestamp={message.timestamp}
               />
             ))}
-            }
+            {isLoading && (
+              <div className="flex justify-start">
+                <div
+                  className="bg-secondary text-secondary-foreground border-4 border-secondary/80 px-4 py-3 animate-pulse-glow"
+                  style={{
+                    boxShadow: '4px 4px 0px rgba(0, 0, 0, 0.3)',
+                    borderRadius: '0px'
+                  }}
                 >
                   <div className="flex space-x-2 items-center">
                     <div className="w-2 h-2 bg-primary animate-bounce" style={{ borderRadius: '0px' }} />
@@ -719,5 +729,121 @@ def topk_chars(wrapper, logits, k=10):
         toks.append((t, v, i))
     return toks
 
-def constrained_finish(wrapper, prefix,
+def constrained_finish(wrapper, prefix, max_inside=120, verbose=True):
+    """Continue AFTER seeing AI2025{, allowing only ALLOWED or '}'."""
+    itos = wrapper.itos
+    inside = ""
+    while len(inside) < max_inside:
+        logits = logits_at_mask(wrapper, prefix + inside)
+        # build mask
+        mask = torch.full_like(logits, float("-inf"))
+        allowed_ids = []
+        for tid in range(len(wrapper.vocab)):
+            tok = itos[tid] if isinstance(itos, dict) else itos(tid)
+            if tok == "}" or (len(tok) == 1 and tok in ALLOWED):
+                allowed_ids.append(tid)
+        mask[torch.tensor(allowed_ids)] = 0.0
+        logits = logits + mask
+        vals, idxs = torch.topk(F.softmax(logits, dim=-1), 10)
+        for j, tid in enumerate(idxs.tolist()):
+            tok = itos[tid] if isinstance(itos, dict) else itos(tid)
+            if tok == "}" or (len(tok) == 1 and tok in ALLOWED):
+                inside += tok
+                if verbose:
+                    print(f"  + '{tok}' (p={vals[j]:.3f}) => {FLAG_START+inside}")
+                break
+        if inside.endswith("}"):
+            return FLAG_START + inside
+    return None
+
+def beam_search_until_flag(wrapper, seeds, steps=160, k=12):
+    beams = [(s, 0.0) for s in seeds]  # (text, logprob)
+    seen = set(s for s, _ in beams)
+    for t in range(steps):
+        new_beams = []
+        for s, lp in beams:
+            logits = logits_at_mask(wrapper, s)
+            for tok, p, _ in topk_chars(wrapper, logits, k=k):
+                if tok in ("[PAD]", "[UNK]") or tok.startswith("["):
+                    continue
+                ns = s + tok
+                if ns in seen:
+                    continue
+                seen.add(ns)
+                nlp = lp + math.log(p + 1e-12)
+                new_beams.append((ns, nlp))
+        new_beams.sort(key=lambda x: x[1], reverse=True)
+        beams = new_beams[:k]
+        # check for start
+        for s, _ in beams:
+            i = s.find(FLAG_START)
+            if i != -1:
+                return s[:i+len(FLAG_START)]
+    return None
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--prefix", default=None, help="Full context ending with AI2025{")
+    ap.add_argument("--seeds", nargs="*", default=[
+        "TRY: action=post path=/api/auth/login type=request body={\\\"name\\\":\\\"admin\\\",\\\"pw\\\":\\\"",
+        "ENTRY: action=post path=/api/auth/login type=request body={\\\"name\\\":\\\"admin\\\",\\\"pw\\\":\\\"",
+        "token=", "password=", "pwd="
+    ])
+    ap.add_argument("--beam_k", type=int, default=12)
+    ap.add_argument("--beam_steps", type=int, default=160)
+    ap.add_argument("--max_inside", type=int, default=120)
+    args = ap.parse_args()
+
+    wrapper = load_hf_gpt2_model(model_path=".", vocab_path="./vocab.json")
+    print(f"[+] Loaded; vocab={len(wrapper.vocab)} seq_len={SEQ_LEN}")
+
+    prefix = args.prefix
+    if prefix and not prefix.endswith(FLAG_START):
+        if not prefix.endswith('"'):
+            prefix += '"'
+        if not prefix.endswith(FLAG_START):
+            prefix += FLAG_START
+
+    if not prefix:
+        print("[i] Searching for the flag start with seeds...")
+        prefix = beam_search_until_flag(wrapper, args.seeds, 
+                                        steps=args.beam_steps, k=args.beam_k)
+        if not prefix:
+            print("[x] Could not reach AI2025{ from seeds; raise --beam_steps/--beam_k or adjust seeds.")
+            return
+
+    print(f"[+] Found start context:\n{prefix[-120:]}")
+    print("[i] Constraining characters until '}' ...")
+    flag = constrained_finish(wrapper, prefix, 
+                             max_inside=args.max_inside, verbose=True)
+
+    if flag:
+        print(f"\n[✓] FLAG: {flag}")
+    else:
+        print("[x] Reached cap without closing brace. Try a different seed/context or raise --max_inside.")
+
+if __name__ == "__main__":
+    main()
 ```
+
+---
+
+## Summary
+
+This CTF covered various AI security challenges including:
+
+- **Audio/Speech Recognition** - KopiTalk
+- **Computer Vision & Backdoors** - MNIST, StrideSafe, Fool the FashionNet!
+- **Deepfake Detection** - Manual analysis challenge
+- **LLM Security** - CoPirate, Guardrails, Lion Roar, Doctor Chao Keng, MLMPire
+- **Adversarial Attacks** - FashionNet perturbation generation
+
+Key techniques used:
+- CLIP for image classification
+- PGD attacks for adversarial examples
+- Beam search for flag extraction from language models
+- Manual deepfake analysis
+- API key discovery through OSINT
+- Prompt engineering and jailbreaking
+
+All challenges required creative approaches combining ML knowledge with security techniques!
